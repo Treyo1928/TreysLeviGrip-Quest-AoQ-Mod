@@ -25,7 +25,8 @@ All values are editable in-game via **Mods → Configure Mods → Treys Levi Gri
 | `GripOffsetX` | float | `82.0` | X rotation of the grip offset in degrees |
 | `GripOffsetZ` | float | `180.0` | Z rotation of the grip offset in degrees |
 | `FlipDuration` | float | `0.25` | Duration of the flip animation in seconds |
-| `HoldDuration` | float | `0.2` | Seconds to hold the right thumbstick before swapping weapon |
+| `HoldDuration` | float | `0.2` | Seconds to hold the right thumbstick to trigger the hold action |
+| `SwapControls` | bool | `false` | `false` = tap flips grip / hold swaps weapon. `true` = tap swaps weapon / hold flips grip |
 
 Config is stored at:
 ```

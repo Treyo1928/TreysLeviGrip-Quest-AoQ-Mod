@@ -1,9 +1,12 @@
 /* liblevigrip-quest/src/main.c
  * Quest C port of TreysLeviGrip for AttackOnQuest 0.5.0
  *
- * Controls:
+ * Controls (default):
  *   Left A button      — toggle left levi grip
  *   Right thumbstick   — tap = flip right grip, hold = swap weapon
+ *
+ * With SwapControls = true:
+ *   Right thumbstick   — tap = swap weapon, hold = flip right grip
  */
 
 #include <android/log.h>
@@ -40,20 +43,23 @@ static SetActive_t        fn_SetActive        = NULL;
 static SwordDisabled_t    fn_SwordDisabled    = NULL;
 
 /* ── Config (cached; refreshed on each flip / weapon swap) ─────────── */
-static float cfg_grip_offset_x = 82.0f;
-static float cfg_grip_offset_z = 180.0f;
-static float cfg_flip_duration = 0.25f;
-static float cfg_hold_duration = 0.2f;
+static float cfg_grip_offset_x  = 82.0f;
+static float cfg_grip_offset_z  = 180.0f;
+static float cfg_flip_duration  = 0.25f;
+static float cfg_hold_duration  = 0.2f;
+static int   cfg_swap_controls  = 0;   /* 0 = tap flips / hold swaps (default)
+                                          1 = tap swaps / hold flips            */
 
 static void reload_config(void)
 {
     ModConfig cfg;
     if (load_config("liblevigrip.so", &cfg) != 0) return;
     ModCfgEntry *e;
-    if ((e = get_entry(&cfg, "GripOffsetX")))  cfg_grip_offset_x = (float)e->value_num;
-    if ((e = get_entry(&cfg, "GripOffsetZ")))  cfg_grip_offset_z = (float)e->value_num;
-    if ((e = get_entry(&cfg, "FlipDuration"))) cfg_flip_duration = (float)e->value_num;
-    if ((e = get_entry(&cfg, "HoldDuration"))) cfg_hold_duration = (float)e->value_num;
+    if ((e = get_entry(&cfg, "GripOffsetX")))   cfg_grip_offset_x = (float)e->value_num;
+    if ((e = get_entry(&cfg, "GripOffsetZ")))   cfg_grip_offset_z = (float)e->value_num;
+    if ((e = get_entry(&cfg, "FlipDuration")))  cfg_flip_duration = (float)e->value_num;
+    if ((e = get_entry(&cfg, "HoldDuration")))  cfg_hold_duration = (float)e->value_num;
+    if ((e = get_entry(&cfg, "SwapControls")))  cfg_swap_controls = (int)e->value_num;
 }
 
 /* ── Runtime helpers ─────────────────────────────────────────────────── */
@@ -109,27 +115,50 @@ MAKE_HOOK(WeaponSwap_Update, 0x771800, void, void *self)
     if (fn_OVRInput_Get(OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL)) {
         if (ws_pressing && (t - ws_press_start) > cfg_hold_duration) {
             ws_pressing = 0;
-            LOGI("Swapping weapon");
-            void *rightSword  = *(void **)((char *)self + 0x0C);
-            void *timerCanvas = *(void **)((char *)self + 0x18);
-            void *flareGun    = *(void **)((char *)self + 0x14);
-            if (ws_sword_active) {
-                set_active(rightSword,  0);
-                set_active(timerCanvas, 0);
-                set_active(flareGun,    1);
-                ws_sword_active = 0;
+            if (!cfg_swap_controls) {
+                LOGI("Swapping weapon");
+                void *rightSword  = *(void **)((char *)self + 0x0C);
+                void *timerCanvas = *(void **)((char *)self + 0x18);
+                void *flareGun    = *(void **)((char *)self + 0x14);
+                if (ws_sword_active) {
+                    set_active(rightSword,  0);
+                    set_active(timerCanvas, 0);
+                    set_active(flareGun,    1);
+                    ws_sword_active = 0;
+                } else {
+                    set_active(rightSword,  1);
+                    set_active(timerCanvas, 1);
+                    set_active(flareGun,    0);
+                    ws_sword_active = 1;
+                }
             } else {
-                set_active(rightSword,  1);
-                set_active(timerCanvas, 1);
-                set_active(flareGun,    0);
-                ws_sword_active = 1;
+                LOGI("Flipping right handle (hold)");
+                flip_right();
             }
         }
     } else {
         if (ws_pressing) {
             ws_pressing = 0;
-            LOGI("Flipping right handle");
-            flip_right();
+            if (!cfg_swap_controls) {
+                LOGI("Flipping right handle");
+                flip_right();
+            } else {
+                LOGI("Swapping weapon (tap)");
+                void *rightSword  = *(void **)((char *)self + 0x0C);
+                void *timerCanvas = *(void **)((char *)self + 0x18);
+                void *flareGun    = *(void **)((char *)self + 0x14);
+                if (ws_sword_active) {
+                    set_active(rightSword,  0);
+                    set_active(timerCanvas, 0);
+                    set_active(flareGun,    1);
+                    ws_sword_active = 0;
+                } else {
+                    set_active(rightSword,  1);
+                    set_active(timerCanvas, 1);
+                    set_active(flareGun,    0);
+                    ws_sword_active = 1;
+                }
+            }
         }
     }
 }
@@ -151,27 +180,50 @@ MAKE_HOOK(NetworkWeaponSwap_Update, 0x63584C, void, void *self)
     if (fn_OVRInput_Get(OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL)) {
         if (nws_pressing && (t - nws_press_start) > cfg_hold_duration) {
             nws_pressing = 0;
-            LOGI("Swapping weapon (network)");
-            void *rightSword        = *(void **)((char *)self + 0x10);
-            void *flareGun          = *(void **)((char *)self + 0x14);
-            void *networkRightSword = *(void **)((char *)self + 0x18);
-            if (nws_sword_active) {
-                if (fn_SwordDisabled && networkRightSword)
-                    fn_SwordDisabled(networkRightSword);
-                set_active(rightSword, 0);
-                set_active(flareGun,   1);
-                nws_sword_active = 0;
+            if (!cfg_swap_controls) {
+                LOGI("Swapping weapon (network)");
+                void *rightSword        = *(void **)((char *)self + 0x10);
+                void *flareGun          = *(void **)((char *)self + 0x14);
+                void *networkRightSword = *(void **)((char *)self + 0x18);
+                if (nws_sword_active) {
+                    if (fn_SwordDisabled && networkRightSword)
+                        fn_SwordDisabled(networkRightSword);
+                    set_active(rightSword, 0);
+                    set_active(flareGun,   1);
+                    nws_sword_active = 0;
+                } else {
+                    set_active(rightSword, 1);
+                    set_active(flareGun,   0);
+                    nws_sword_active = 1;
+                }
             } else {
-                set_active(rightSword, 1);
-                set_active(flareGun,   0);
-                nws_sword_active = 1;
+                LOGI("Flipping right handle (network, hold)");
+                flip_right();
             }
         }
     } else {
         if (nws_pressing) {
             nws_pressing = 0;
-            LOGI("Flipping right handle (network)");
-            flip_right();
+            if (!cfg_swap_controls) {
+                LOGI("Flipping right handle (network)");
+                flip_right();
+            } else {
+                LOGI("Swapping weapon (network, tap)");
+                void *rightSword        = *(void **)((char *)self + 0x10);
+                void *flareGun          = *(void **)((char *)self + 0x14);
+                void *networkRightSword = *(void **)((char *)self + 0x18);
+                if (nws_sword_active) {
+                    if (fn_SwordDisabled && networkRightSword)
+                        fn_SwordDisabled(networkRightSword);
+                    set_active(rightSword, 0);
+                    set_active(flareGun,   1);
+                    nws_sword_active = 0;
+                } else {
+                    set_active(rightSword, 1);
+                    set_active(flareGun,   0);
+                    nws_sword_active = 1;
+                }
+            }
         }
     }
 }
@@ -244,7 +296,10 @@ __attribute__((constructor)) void lib_main(void)
         "    {\"key\":\"FlipDuration\",\"type\":\"float\",\"value\":0.25,"
             "\"description\":\"Duration of the flip animation in seconds.\"},\n"
         "    {\"key\":\"HoldDuration\",\"type\":\"float\",\"value\":0.2,"
-            "\"description\":\"Seconds to hold right thumbstick before swapping weapon.\"}\n"
+            "\"description\":\"Seconds to hold right thumbstick to trigger the hold action.\"},\n"
+        "    {\"key\":\"SwapControls\",\"type\":\"bool\",\"value\":false,"
+            "\"description\":\"false = tap flips grip / hold swaps weapon (default). "
+            "true = tap swaps weapon / hold flips grip.\"}\n"
         "  ]\n"
         "}\n"
     );
