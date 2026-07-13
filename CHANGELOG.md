@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.0.0
+## v1.1.1
 
 Multiplayer fixes and a crash fix.
 
