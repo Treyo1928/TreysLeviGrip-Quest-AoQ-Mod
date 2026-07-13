@@ -1,14 +1,17 @@
 LOCAL_PATH := $(call my-dir)
 
+MODLOADER := ../../AoQ-ModLoader-For-Quest
+
 include $(CLEAR_VARS)
 LOCAL_MODULE    := levigrip
 LOCAL_LDLIBS    := -llog
 LOCAL_SRC_FILES := \
     ../src/main.c \
-    ../../AoQ-ModLoader-For-Quest/shared/inline-hook/inlineHook.c \
-    ../../AoQ-ModLoader-For-Quest/shared/inline-hook/relocate.c \
-    ../../AoQ-ModLoader-For-Quest/shared/utils/utils.c \
-    ../../AoQ-ModLoader-For-Quest/modmanager/modconfig.c \
-    ../../AoQ-ModLoader-For-Quest/modmanager/cJSON.c
-LOCAL_C_INCLUDES := $(LOCAL_PATH)/../../AoQ-ModLoader-For-Quest/modmanager
+    $(MODLOADER)/shared/aoqcore/aoq.c \
+    $(MODLOADER)/shared/inline-hook/inlineHook.c \
+    $(MODLOADER)/shared/inline-hook/relocate.c \
+    $(MODLOADER)/shared/utils/utils.c \
+    $(MODLOADER)/modmanager/modconfig.c \
+    $(MODLOADER)/modmanager/cJSON.c
+LOCAL_C_INCLUDES := $(LOCAL_PATH)/$(MODLOADER)/modmanager
 include $(BUILD_SHARED_LIBRARY)

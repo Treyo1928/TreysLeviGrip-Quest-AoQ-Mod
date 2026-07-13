@@ -7,8 +7,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NDK_BUILD="/home/treyb/QuestCompilation/android-ndk-r26d/ndk-build"
-MODS_DIR="/sdcard/Android/data/com.AoQ.AttackOnQuest/files/mods"
+NDK_BUILD="${NDK_BUILD:-$(command -v ndk-build 2>/dev/null)}"
+NDK_BUILD="${NDK_BUILD:-/opt/android-ndk/ndk-build}"
+MODS_DIR="/sdcard/DCIM/AoQMods/mods"
 
 DO_PUSH=0
 DO_LOGS=0

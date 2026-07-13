@@ -7,19 +7,34 @@
  *
  * With SwapControls = true:
  *   Right thumbstick   — tap = swap weapon, hold = flip right grip
+ *
+ * v2 rewrite notes:
+ *  - Multiplayer swap now calls the game's own NetworkWeaponSwap.Swap(),
+ *    which sends the SwapWeapon RPC — other players finally SEE your swap,
+ *    and NetworkRightSword.SwordDisabled() runs exactly like vanilla.
+ *  - All per-instance work is gated on photonView.IsMine. v1 ran the swap
+ *    logic on EVERY player's NetworkWeaponSwap clone (touching other
+ *    players' sword objects locally, and running during the room-teardown
+ *    window after a kick — the prime suspect for the kick crash).
+ *  - Weapon state is read live from rightSword.activeSelf instead of a
+ *    static flag that went stale across deaths/scene reloads.
+ *  - Hand anchors are null/liveness-checked before rotating, and the flip
+ *    animation fraction is clamped (no more one-frame overshoot).
+ *  - Config is cached (no per-flip disk reads).
  */
 
 #include <android/log.h>
+#include <stdio.h>
+#include <stdint.h>
 #include "../../AoQ-ModLoader-For-Quest/shared/inline-hook/inlineHook.h"
 #include "../../AoQ-ModLoader-For-Quest/shared/utils/utils.h"
+#include "../../AoQ-ModLoader-For-Quest/shared/aoqcore/aoq.h"
 #include "../../AoQ-ModLoader-For-Quest/shared/modapi/modapi.h"
-#include "../../AoQ-ModLoader-For-Quest/modmanager/modconfig.h"
 
 #define TAG "LeviGrip"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-/* ── Unity types ────────────────────────────────────────────────────── */
-typedef struct { float x, y, z; } Vector3;
+#define MOD_SO_NAME "liblevigrip.so"
 
 /* ── OVRInput button / controller constants (from dump.cs enums) ──── */
 #define OVR_BTN_ONE            0x00000001   /* A (right) / X (left) */
@@ -27,22 +42,50 @@ typedef struct { float x, y, z; } Vector3;
 #define OVR_CTRL_LTOUCH        1
 #define OVR_CTRL_RTOUCH        2
 
+/* ── RVAs (AoQ 0.5.0, verified with Il2CppDumper) ───────────────────── */
+#define RVA_OVRInput_GetDown        0xAF7CAC
+#define RVA_OVRInput_Get            0xAF7A08
+#define RVA_Transform_Rotate_Vec3   0xFD6DFC
+#define RVA_Time_get_time           0xFD3EE0
+#define RVA_GO_get_activeSelf       0xC74648
+#define RVA_NWS_Swap                0x635910  /* NetworkWeaponSwap.Swap() — does the RPC */
+
+/* Hook targets */
+#define ADDR_WeaponSwap_Update          0x771800
+#define ADDR_NetworkWeaponSwap_Update   0x63584C
+#define ADDR_OVRCameraRig_UpdateAnchors 0x5AB168
+
+/* ── Field offsets (from dump.cs) ───────────────────────────────────── */
+/* WeaponSwap:        rightSword 0xC | flareGun 0x14 | timerCanvas 0x18 | player 0x1C */
+#define WS_RIGHT_SWORD_OFF   0x0C
+#define WS_FLARE_GUN_OFF     0x14
+#define WS_TIMER_CANVAS_OFF  0x18
+#define WS_PLAYER_OFF        0x1C
+/* OVRCameraRig:      leftHandAnchor 0x1C | rightHandAnchor 0x20 (backing fields) */
+#define RIG_LEFT_ANCHOR_OFF  0x1C
+#define RIG_RIGHT_ANCHOR_OFF 0x20
+/* Salute:            saluteRight1 0xC | saluteRight2 0xD */
+#define SALUTE_RIGHT1_OFF    0x0C
+#define SALUTE_RIGHT2_OFF    0x0D
+
 /* ── Function pointer types ─────────────────────────────────────────── */
 typedef int   (*OVRInput_GetDown_t)(int btn, int ctrl, void *mi);
 typedef int   (*OVRInput_Get_t)    (int btn, int ctrl, void *mi);
-typedef void  (*Transform_Rotate_t)(void *self, Vector3 eulers, void *mi);
+typedef void  (*Transform_Rotate_t)(void *self, AoqVec3 eulers, void *mi);
 typedef float (*Time_get_time_t)   (void *mi);
-typedef void  (*SetActive_t)       (void *self, int value);   /* instance — no mi */
-typedef void  (*SwordDisabled_t)   (void *self);              /* instance — no mi */
+typedef int   (*GO_get_active_t)   (void *self);   /* instance — no mi */
+typedef void  (*NWS_Swap_t)        (void *self);   /* instance — no mi */
 
 static OVRInput_GetDown_t fn_OVRInput_GetDown = NULL;
 static OVRInput_Get_t     fn_OVRInput_Get     = NULL;
 static Transform_Rotate_t fn_Transform_Rotate = NULL;
 static Time_get_time_t    fn_Time_get_time    = NULL;
-static SetActive_t        fn_SetActive        = NULL;
-static SwordDisabled_t    fn_SwordDisabled    = NULL;
+static GO_get_active_t    fn_GO_get_active    = NULL;
+static NWS_Swap_t         fn_NWS_Swap         = NULL;
 
-/* ── Config (cached; refreshed on each flip / weapon swap) ─────────── */
+/* ── Config (cached; refreshed on button events, never per frame) ───── */
+static AoqCfgCache g_cfg = {0};
+
 static float cfg_grip_offset_x  = 82.0f;
 static float cfg_grip_offset_z  = 180.0f;
 static float cfg_flip_duration  = 0.25f;
@@ -50,29 +93,29 @@ static float cfg_hold_duration  = 0.2f;
 static int   cfg_swap_controls  = 0;   /* 0 = tap flips / hold swaps (default)
                                           1 = tap swaps / hold flips            */
 
-static void reload_config(void)
+static void refresh_config(void)
 {
-    ModConfig cfg;
-    if (load_config("liblevigrip.so", &cfg) != 0) return;
-    ModCfgEntry *e;
-    if ((e = get_entry(&cfg, "GripOffsetX")))   cfg_grip_offset_x = (float)e->value_num;
-    if ((e = get_entry(&cfg, "GripOffsetZ")))   cfg_grip_offset_z = (float)e->value_num;
-    if ((e = get_entry(&cfg, "FlipDuration")))  cfg_flip_duration = (float)e->value_num;
-    if ((e = get_entry(&cfg, "HoldDuration")))  cfg_hold_duration = (float)e->value_num;
-    if ((e = get_entry(&cfg, "SwapControls")))  cfg_swap_controls = (int)e->value_num;
+    if (aoq_cfg_refresh(&g_cfg, MOD_SO_NAME) != 0) return;
+    cfg_grip_offset_x = aoq_cfg_flt (&g_cfg, "GripOffsetX",  82.0f);
+    cfg_grip_offset_z = aoq_cfg_flt (&g_cfg, "GripOffsetZ",  180.0f);
+    cfg_flip_duration = aoq_cfg_flt (&g_cfg, "FlipDuration", 0.25f);
+    cfg_hold_duration = aoq_cfg_flt (&g_cfg, "HoldDuration", 0.2f);
+    cfg_swap_controls = aoq_cfg_bool(&g_cfg, "SwapControls", 0);
 }
 
 /* ── Runtime helpers ─────────────────────────────────────────────────── */
 static float get_time(void) { return fn_Time_get_time ? fn_Time_get_time(NULL) : 0.0f; }
 
-static void set_active(void *obj, int v)
+static int go_active(void *go)
 {
-    if (fn_SetActive && obj) fn_SetActive(obj, v);
+    return (fn_GO_get_active && aoq_alive(go)) ? fn_GO_get_active(go) : 0;
 }
 
-static Vector3 lerp3(Vector3 a, Vector3 b, float t)
+static AoqVec3 lerp3(AoqVec3 a, AoqVec3 b, float t)
 {
-    return (Vector3){
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return (AoqVec3){
         a.x + (b.x - a.x) * t,
         a.y + (b.y - a.y) * t,
         a.z + (b.z - a.z) * t
@@ -84,197 +127,131 @@ static int   left_levi_grip  = 0, right_levi_grip = 0;
 static int   left_flip_anim  = 0, right_flip_anim  = 0;
 static float left_flip_start = 0, right_flip_start  = 0;
 
-/* Track which weapon is active (1 = sword, 0 = flare gun).
-   Initialised to 1 — game default on level start.               */
-static int ws_sword_active  = 1;   /* WeaponSwap instance */
-static int nws_sword_active = 1;   /* NetworkWeaponSwap instance */
-
 static void flip_right(void)
 {
-    reload_config();
+    refresh_config();
     right_flip_anim  = 1;
     right_levi_grip  = !right_levi_grip;
     right_flip_start = get_time();
 }
 
-/* ── WeaponSwap.Update (full replacement) ───────────────────────────── */
-/*   Fields: rightSword 0xC | leftSword 0x10 | flareGun 0x14
- *           timerCanvas 0x18 | player 0x1C                             */
-static float ws_press_start = 0;
-static int   ws_pressing    = 0;
-
-MAKE_HOOK(WeaponSwap_Update, 0x771800, void, void *self)
+/* ── Single-player weapon swap (replicates WeaponSwap.Update body) ──── */
+static void sp_swap(void *self)
 {
-    /* Original never called — full replacement */
-    float t = get_time();
+    void *rightSword  = AOQ_FIELD(self, WS_RIGHT_SWORD_OFF,  void *);
+    void *flareGun    = AOQ_FIELD(self, WS_FLARE_GUN_OFF,    void *);
+    void *timerCanvas = AOQ_FIELD(self, WS_TIMER_CANVAS_OFF, void *);
 
-    if (fn_OVRInput_GetDown(OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL)) {
-        ws_press_start = t;
-        ws_pressing    = 1;
-    }
-    if (fn_OVRInput_Get(OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL)) {
-        if (ws_pressing && (t - ws_press_start) > cfg_hold_duration) {
-            ws_pressing = 0;
-            if (!cfg_swap_controls) {
-                LOGI("Swapping weapon");
-                void *rightSword  = *(void **)((char *)self + 0x0C);
-                void *timerCanvas = *(void **)((char *)self + 0x18);
-                void *flareGun    = *(void **)((char *)self + 0x14);
-                if (ws_sword_active) {
-                    set_active(rightSword,  0);
-                    set_active(timerCanvas, 0);
-                    set_active(flareGun,    1);
-                    ws_sword_active = 0;
-                } else {
-                    set_active(rightSword,  1);
-                    set_active(timerCanvas, 1);
-                    set_active(flareGun,    0);
-                    ws_sword_active = 1;
-                }
-            } else {
-                LOGI("Flipping right handle (hold)");
-                flip_right();
-            }
+    if (go_active(rightSword)) {
+        aoq_go_set_active(rightSword,  0);
+        aoq_go_set_active(timerCanvas, 0);
+        aoq_go_set_active(flareGun,    1);
+        /* Vanilla also clears the salute pose flags when holstering */
+        void *player = AOQ_FIELD(self, WS_PLAYER_OFF, void *);
+        void *salute = aoq_alive(player)
+                     ? aoq_go_get_component_named(player, "", "Salute") : NULL;
+        if (salute) {
+            AOQ_FIELD(salute, SALUTE_RIGHT1_OFF, uint8_t) = 0;
+            AOQ_FIELD(salute, SALUTE_RIGHT2_OFF, uint8_t) = 0;
         }
     } else {
-        if (ws_pressing) {
-            ws_pressing = 0;
-            if (!cfg_swap_controls) {
-                LOGI("Flipping right handle");
-                flip_right();
-            } else {
-                LOGI("Swapping weapon (tap)");
-                void *rightSword  = *(void **)((char *)self + 0x0C);
-                void *timerCanvas = *(void **)((char *)self + 0x18);
-                void *flareGun    = *(void **)((char *)self + 0x14);
-                if (ws_sword_active) {
-                    set_active(rightSword,  0);
-                    set_active(timerCanvas, 0);
-                    set_active(flareGun,    1);
-                    ws_sword_active = 0;
-                } else {
-                    set_active(rightSword,  1);
-                    set_active(timerCanvas, 1);
-                    set_active(flareGun,    0);
-                    ws_sword_active = 1;
-                }
-            }
-        }
+        aoq_go_set_active(rightSword,  1);
+        aoq_go_set_active(timerCanvas, 1);
+        aoq_go_set_active(flareGun,    0);
     }
 }
 
-/* ── NetworkWeaponSwap.Update (full replacement) ────────────────────── */
-/*   Fields: rightSword 0x10 | flareGun 0x14 | networkRightSword 0x18  */
-static float nws_press_start = 0;
-static int   nws_pressing    = 0;
-
-MAKE_HOOK(NetworkWeaponSwap_Update, 0x63584C, void, void *self)
+/* ── Multiplayer weapon swap — let the game do it (RPC + SwordDisabled) */
+static void mp_swap(void *self)
 {
-    /* Original never called — full replacement */
-    float t = get_time();
+    if (fn_NWS_Swap) fn_NWS_Swap(self);
+}
 
-    if (fn_OVRInput_GetDown(OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL)) {
-        nws_press_start = t;
-        nws_pressing    = 1;
-    }
-    if (fn_OVRInput_Get(OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL)) {
-        if (nws_pressing && (t - nws_press_start) > cfg_hold_duration) {
-            nws_pressing = 0;
-            if (!cfg_swap_controls) {
-                LOGI("Swapping weapon (network)");
-                void *rightSword        = *(void **)((char *)self + 0x10);
-                void *flareGun          = *(void **)((char *)self + 0x14);
-                void *networkRightSword = *(void **)((char *)self + 0x18);
-                if (nws_sword_active) {
-                    if (fn_SwordDisabled && networkRightSword)
-                        fn_SwordDisabled(networkRightSword);
-                    set_active(rightSword, 0);
-                    set_active(flareGun,   1);
-                    nws_sword_active = 0;
-                } else {
-                    set_active(rightSword, 1);
-                    set_active(flareGun,   0);
-                    nws_sword_active = 1;
-                }
-            } else {
-                LOGI("Flipping right handle (network, hold)");
-                flip_right();
-            }
-        }
-    } else {
-        if (nws_pressing) {
-            nws_pressing = 0;
-            if (!cfg_swap_controls) {
-                LOGI("Flipping right handle (network)");
-                flip_right();
-            } else {
-                LOGI("Swapping weapon (network, tap)");
-                void *rightSword        = *(void **)((char *)self + 0x10);
-                void *flareGun          = *(void **)((char *)self + 0x14);
-                void *networkRightSword = *(void **)((char *)self + 0x18);
-                if (nws_sword_active) {
-                    if (fn_SwordDisabled && networkRightSword)
-                        fn_SwordDisabled(networkRightSword);
-                    set_active(rightSword, 0);
-                    set_active(flareGun,   1);
-                    nws_sword_active = 0;
-                } else {
-                    set_active(rightSword, 1);
-                    set_active(flareGun,   0);
-                    nws_sword_active = 1;
-                }
-            }
-        }
-    }
+/* ── Shared tap/hold dispatch for both Update hooks ─────────────────── */
+static void handle_thumbstick(void *self, AoqTapHold *st, void (*swap)(void *))
+{
+    int down = fn_OVRInput_GetDown(OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL);
+    int held = fn_OVRInput_Get   (OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL);
+    if (down) refresh_config();
+
+    int ev = aoq_tap_hold(st, down, held, get_time(), cfg_hold_duration);
+    if (ev == AOQ_INPUT_NONE) return;
+
+    /* Default: tap flips, hold swaps. SwapControls inverts that. */
+    int do_swap = cfg_swap_controls ? (ev == AOQ_INPUT_TAP) : (ev == AOQ_INPUT_HOLD);
+    if (do_swap) { LOGI("Swapping weapon");       swap(self); }
+    else         { LOGI("Flipping right handle"); flip_right(); }
+}
+
+/* ── WeaponSwap.Update (single player, full replacement) ────────────── */
+static AoqTapHold ws_th = {0};
+
+MAKE_HOOK(WeaponSwap_Update, ADDR_WeaponSwap_Update, void, void *self)
+{
+    /* Original never called — it swaps instantly on thumbstick-down, which
+     * conflicts with our tap/hold scheme. sp_swap() replicates its body. */
+    handle_thumbstick(self, &ws_th, sp_swap);
+}
+
+/* ── NetworkWeaponSwap.Update (multiplayer, full replacement) ───────── */
+static AoqTapHold nws_th = {0};
+
+MAKE_HOOK(NetworkWeaponSwap_Update, ADDR_NetworkWeaponSwap_Update, void, void *self)
+{
+    /* Vanilla gates on photonView.IsMine — so do we. Without this the hook
+     * ran for every player's clone and kept running on half-dead objects
+     * during room teardown (kick/leave). */
+    if (!aoq_is_mine(self)) return;
+    handle_thumbstick(self, &nws_th, mp_swap);
 }
 
 /* ── OVRCameraRig.UpdateAnchors (postfix) ───────────────────────────── */
-/*   Fields: leftHandAnchor 0x1C | rightHandAnchor 0x20                 */
 
-MAKE_HOOK(OVRCameraRig_UpdateAnchors, 0x5AB168, void, void *self, int updateEye, int updateHand)
+static void apply_grip(void *anchor, int grip, int *anim, float anim_start,
+                       AoqVec3 offset, AoqVec3 anim_target, float now)
+{
+    if (!aoq_alive(anchor)) return;
+
+    if (grip && !*anim) {
+        fn_Transform_Rotate(anchor, offset, NULL);
+    } else if (*anim) {
+        AoqVec3 zero  = { 0.0f, 0.0f, 0.0f };
+        AoqVec3 start = grip ? zero        : anim_target;
+        AoqVec3 end   = grip ? anim_target : zero;
+        float frac = cfg_flip_duration > 0.0f
+                   ? (now - anim_start) / cfg_flip_duration : 1.0f;
+        fn_Transform_Rotate(anchor, lerp3(start, end, frac), NULL);
+        if (frac >= 1.0f) *anim = 0;
+    }
+}
+
+MAKE_HOOK(OVRCameraRig_UpdateAnchors, ADDR_OVRCameraRig_UpdateAnchors,
+          void, void *self, int updateEye, int updateHand)
 {
     OVRCameraRig_UpdateAnchors(self, updateEye, updateHand);   /* run original first */
 
     if (!fn_Transform_Rotate) return;
 
-    void  *leftAnchor  = *(void **)((char *)self + 0x1C);
-    void  *rightAnchor = *(void **)((char *)self + 0x20);
+    void  *leftAnchor  = AOQ_FIELD(self, RIG_LEFT_ANCHOR_OFF,  void *);
+    void  *rightAnchor = AOQ_FIELD(self, RIG_RIGHT_ANCHOR_OFF, void *);
     float  t           = get_time();
-    Vector3 zero       = { 0.0f, 0.0f, 0.0f };
-    Vector3 offset     = { cfg_grip_offset_x, 0.0f, cfg_grip_offset_z };
 
     /* Left A button (Button.One = 1, LTouch = 1) toggles left grip */
     if (fn_OVRInput_GetDown(OVR_BTN_ONE, OVR_CTRL_LTOUCH, NULL) && !left_flip_anim) {
-        reload_config();
-        offset = (Vector3){ cfg_grip_offset_x, 0.0f, cfg_grip_offset_z };
+        refresh_config();
         left_flip_anim  = 1;
         left_levi_grip  = !left_levi_grip;
         left_flip_start = t;
     }
 
-    /* ── Left hand ───────────────────────────────────────────────────── */
-    if (left_levi_grip && !left_flip_anim) {
-        fn_Transform_Rotate(leftAnchor, offset, NULL);
-    } else if (left_flip_anim) {
-        Vector3 start = left_levi_grip ? zero   : offset;
-        Vector3 end   = left_levi_grip ? offset : zero;
-        float frac = (t - left_flip_start) / cfg_flip_duration;
-        fn_Transform_Rotate(leftAnchor, lerp3(start, end, frac), NULL);
-        if (t - left_flip_start > cfg_flip_duration) left_flip_anim = 0;
-    }
+    AoqVec3 offset = { cfg_grip_offset_x, 0.0f, cfg_grip_offset_z };
+    /* Right animation path uses offset.z - 360 so the flip goes through -180 */
+    AoqVec3 right_offset = { cfg_grip_offset_x, 0.0f, cfg_grip_offset_z - 360.0f };
 
-    /* ── Right hand ──────────────────────────────────────────────────── */
-    /* Animation path uses offset.z - 360 so the flip goes through -180  */
-    Vector3 right_offset = { cfg_grip_offset_x, 0.0f, cfg_grip_offset_z - 360.0f };
-    if (right_levi_grip && !right_flip_anim) {
-        fn_Transform_Rotate(rightAnchor, offset, NULL);
-    } else if (right_flip_anim) {
-        Vector3 start = right_levi_grip ? zero         : right_offset;
-        Vector3 end   = right_levi_grip ? right_offset : zero;
-        float frac = (t - right_flip_start) / cfg_flip_duration;
-        fn_Transform_Rotate(rightAnchor, lerp3(start, end, frac), NULL);
-        if (t - right_flip_start > cfg_flip_duration) right_flip_anim = 0;
-    }
+    apply_grip(leftAnchor,  left_levi_grip,  &left_flip_anim,  left_flip_start,
+               offset, offset, t);
+    apply_grip(rightAnchor, right_levi_grip, &right_flip_anim, right_flip_start,
+               offset, right_offset, t);
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────── */
@@ -282,11 +259,11 @@ __attribute__((constructor)) void lib_main(void)
 {
     LOGI("loading...");
 
-    aoqmm_register("liblevigrip.so", "Treys Levi Grip", "1.0.0", "Treyo1928",
+    aoqmm_register(MOD_SO_NAME, "Treys Levi Grip", "2.0.0", "Treyo1928",
                    "Rotates hand anchors for a levi-style grip. "
                    "Left A = toggle left grip, right thumbstick tap = flip right, hold = swap weapon.");
 
-    aoqmm_ensure_config("liblevigrip.so",
+    aoqmm_ensure_config(MOD_SO_NAME,
         "{\n"
         "  \"entries\": [\n"
         "    {\"key\":\"GripOffsetX\",\"type\":\"float\",\"value\":82.0,"
@@ -304,14 +281,15 @@ __attribute__((constructor)) void lib_main(void)
         "}\n"
     );
 
-    reload_config();
+    aoq_init();
+    refresh_config();
 
-    fn_OVRInput_GetDown = (OVRInput_GetDown_t) getRealOffset(0xAF7CAC);
-    fn_OVRInput_Get     = (OVRInput_Get_t)     getRealOffset(0xAF7A08);
-    fn_Transform_Rotate = (Transform_Rotate_t) getRealOffset(0xFD6DFC);
-    fn_Time_get_time    = (Time_get_time_t)    getRealOffset(0xFD3EE0);
-    fn_SetActive        = (SetActive_t)        getRealOffset(0xC745F0);
-    fn_SwordDisabled    = (SwordDisabled_t)    getRealOffset(0x6331BC);
+    fn_OVRInput_GetDown = (OVRInput_GetDown_t) getRealOffset(RVA_OVRInput_GetDown);
+    fn_OVRInput_Get     = (OVRInput_Get_t)     getRealOffset(RVA_OVRInput_Get);
+    fn_Transform_Rotate = (Transform_Rotate_t) getRealOffset(RVA_Transform_Rotate_Vec3);
+    fn_Time_get_time    = (Time_get_time_t)    getRealOffset(RVA_Time_get_time);
+    fn_GO_get_active    = (GO_get_active_t)    getRealOffset(RVA_GO_get_activeSelf);
+    fn_NWS_Swap         = (NWS_Swap_t)         getRealOffset(RVA_NWS_Swap);
 
     INSTALL_HOOK(WeaponSwap_Update);
     INSTALL_HOOK(NetworkWeaponSwap_Update);

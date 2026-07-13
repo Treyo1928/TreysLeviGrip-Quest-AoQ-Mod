@@ -4,6 +4,8 @@ A Quest C mod for **Attack on Quest (AoQ) 0.5.0** that rotates your hand anchors
 
 Built on the [AoQ-ModLoader-For-Quest](https://github.com/Treyo1928/AoQ-Modloader) framework.
 
+**v2.0.0:** multiplayer swap now uses the game's own RPC (other players see your swap), everything is gated on `photonView.IsMine`, destroyed-object accesses are guarded (kick/leave-room crash fix), and weapon state is read live instead of tracked in statics.
+
 ---
 
 ## Controls
@@ -30,7 +32,7 @@ All values are editable in-game via **Mods → Configure Mods → Treys Levi Gri
 
 Config is stored at:
 ```
-/sdcard/Android/data/com.AoQ.AttackOnQuest/files/modconfigs/levigrip.json
+/sdcard/DCIM/AoQMods/modconfigs/levigrip.json
 ```
 
 ---
@@ -42,7 +44,7 @@ Config is stored at:
 1. Download `liblevigrip.so` from the [Releases](../../releases) page.
 2. Push it to your headset:
 ```bash
-adb push liblevigrip.so /sdcard/Android/data/com.AoQ.AttackOnQuest/files/mods/
+adb push liblevigrip.so /sdcard/DCIM/AoQMods/mods/
 ```
 3. Restart the game. The mod will appear in the **Mods** panel in the main menu.
 
@@ -50,11 +52,13 @@ adb push liblevigrip.so /sdcard/Android/data/com.AoQ.AttackOnQuest/files/mods/
 
 ## Build from Source
 
-**Prerequisites:** Android NDK r26d
+**Prerequisites:**
+- Any recent Android NDK (auto-detected from `$NDK_BUILD`, `ndk-build` on PATH, or `/opt/android-ndk`)
+- The [AoQ-Modloader](https://github.com/Treyo1928/AoQ-Modloader) repo cloned **next to this one** as `AoQ-ModLoader-For-Quest` (shared code + the `aoqcore` utility library live there)
 
 ```bash
 git clone <this-repo>
-cd liblevigrip-quest
+cd TreysLeviGrip-Quest-AoQ-Mod
 bash build.sh
 ```
 
