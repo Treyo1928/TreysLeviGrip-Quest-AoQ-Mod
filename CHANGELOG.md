@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.1.2
+
+### Fixed
+- Right-grip flip can no longer be retriggered mid-animation (a fast double-tap
+  restarted the lerp from a half-rotated pose, leaving the grip at a wrong
+  angle) — now guarded the same way as the left grip.
+- Thumbstick handling bails out safely if the OVRInput functions failed to
+  resolve, and a release exactly at the hold threshold now counts as a hold
+  instead of firing a tap (via the shared `aoq_tap_hold` fix).
+
+### Inherited from the shared libraries (rebuild against modloader v1.3.0)
+- Hook engine: trampoline instruction-cache flush (fixes random startup
+  crashes on some devices), relocation fixes, and failed hook installs now
+  log an error instead of silently doing nothing.
+- aoqcore: per-frame helpers are destroyed-object-safe; lazy init can no
+  longer be permanently poisoned by an early call.
+- Config layer: atomic saves, truncation guard, JSON depth cap.
+
+Use with the AoQ-Modloader **v1.3.0** patched APK. Full details in its
+`CHANGELOG.md`.
+
+> **Version note:** if your in-game mod list previously showed "2.0.0", that
+> string was an error in an old build — there was never a 2.x release. The
+> latest actual release before this one is v1.1.1 below.
+
 ## v1.1.1
 
 Multiplayer fixes and a crash fix.
