@@ -8,7 +8,7 @@
  * With SwapControls = true:
  *   Right thumbstick   — tap = swap weapon, hold = flip right grip
  *
- * v2 rewrite notes:
+ * v1.1.1 multiplayer-rewrite notes:
  *  - Multiplayer swap now calls the game's own NetworkWeaponSwap.Swap(),
  *    which sends the SwapWeapon RPC — other players finally SEE your swap,
  *    and NetworkRightSword.SwordDisabled() runs exactly like vanilla.
@@ -129,6 +129,10 @@ static float left_flip_start = 0, right_flip_start  = 0;
 
 static void flip_right(void)
 {
+    /* Ignore retriggers mid-animation — same guard the left grip has.
+     * Without it a quick double-tap restarted the lerp from a half-rotated
+     * pose and the grip ended up at a wrong angle. */
+    if (right_flip_anim) return;
     refresh_config();
     right_flip_anim  = 1;
     right_levi_grip  = !right_levi_grip;
@@ -170,6 +174,7 @@ static void mp_swap(void *self)
 /* ── Shared tap/hold dispatch for both Update hooks ─────────────────── */
 static void handle_thumbstick(void *self, AoqTapHold *st, void (*swap)(void *))
 {
+    if (!fn_OVRInput_GetDown || !fn_OVRInput_Get) return;
     int down = fn_OVRInput_GetDown(OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL);
     int held = fn_OVRInput_Get   (OVR_BTN_PRIMARY_TS, OVR_CTRL_RTOUCH, NULL);
     if (down) refresh_config();
@@ -230,7 +235,7 @@ MAKE_HOOK(OVRCameraRig_UpdateAnchors, ADDR_OVRCameraRig_UpdateAnchors,
 {
     OVRCameraRig_UpdateAnchors(self, updateEye, updateHand);   /* run original first */
 
-    if (!fn_Transform_Rotate) return;
+    if (!fn_Transform_Rotate || !fn_OVRInput_GetDown) return;
 
     void  *leftAnchor  = AOQ_FIELD(self, RIG_LEFT_ANCHOR_OFF,  void *);
     void  *rightAnchor = AOQ_FIELD(self, RIG_RIGHT_ANCHOR_OFF, void *);
@@ -259,7 +264,7 @@ __attribute__((constructor)) void lib_main(void)
 {
     LOGI("loading...");
 
-    aoqmm_register(MOD_SO_NAME, "Treys Levi Grip", "2.0.0", "Treyo1928",
+    aoqmm_register(MOD_SO_NAME, "Treys Levi Grip", "1.1.2", "Treyo1928",
                    "Rotates hand anchors for a levi-style grip. "
                    "Left A = toggle left grip, right thumbstick tap = flip right, hold = swap weapon.");
 
